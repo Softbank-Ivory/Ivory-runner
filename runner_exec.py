@@ -37,26 +37,51 @@ class CodeVisitor(ast.NodeVisitor):
         self.violations = []
 
     def visit(self, node):
-        # 위반 사항이 이미 발견되었다면 더 이상 검사하지 않습니다.
+        # 이미 위반 났으면 더 이상 안 봄
         if not self.is_safe:
             return
 
-        # 금지된 내장 함수 호출이 있는지 확인 (예: open())
+        # 1) 금지된 내장 함수 호출 (예: open())
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             if node.func.id in BLACKLISTED_BUILTINS:
                 self.is_safe = False
-                self.violations.append(f"금지된 내장 함수 '{node.func.id}' 호출이 {node.lineno}번째 줄에서 발견되었습니다")
+                self.violations.append(
+                    f"금지된 내장 함수 '{node.func.id}' 호출이 {node.lineno}번째 줄에서 발견되었습니다"
+                )
                 return
 
-        # 금지된 속성에 접근하는지 확인 (예: os.system)
+        # 2) 금지된 속성 접근 (예: os.system)
         if isinstance(node, ast.Attribute):
             if node.attr in BLACKLISTED_ATTRIBUTES:
                 self.is_safe = False
-                self.violations.append(f"금지된 속성 '{node.attr}' 사용이 {node.lineno}번째 줄에서 발견되었습니다")
+                self.violations.append(
+                    f"금지된 속성 '{node.attr}' 사용이 {node.lineno}번째 줄에서 발견되었습니다"
+                )
                 return
 
-        # 이 노드에서 위반 사항이 없으면 계속 트리를 순회합니다.
+        # 3) 문자열 리터럴에서 URL 패턴 검사 (파이썬 3.8+ Constant)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            self._check_url_in_string(node.value, node.lineno)
+            if not self.is_safe:
+                return
+
+        # 나머지 계속 순회
         super().generic_visit(node)
+
+    def _check_url_in_string(self, s, lineno):
+        """
+        문자열 내에 금지된 URL 패턴이 있는지 확인합니다.
+        """
+        forbidden_patterns = ["http://", "https://", "ftp://", "file://"]
+        for pattern in forbidden_patterns:
+            if pattern in s:
+                self.is_safe = False
+                self.violations.append(
+                    f"금지된 URL 패턴 '{pattern}' 이 {lineno}번째 줄의 문자열에서 발견되었습니다"
+                )
+                return True
+        return False
+
 
 
 def analyze_code_safety(source: str) -> (bool, list):

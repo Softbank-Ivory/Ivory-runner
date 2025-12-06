@@ -4,6 +4,7 @@ import logging
 import tempfile
 import shutil
 import subprocess
+import threading
 from typing import Any, Dict, Optional
 
 import boto3
@@ -240,7 +241,7 @@ def run_invocation():
             json.dump(payload, f, ensure_ascii=False)
 
         # 3) runner_exec.py 호출
-        timeout_ms = 60000
+        timeout_ms = 15000
 
         cmd = [
             "python3",
@@ -259,9 +260,8 @@ def run_invocation():
         send_status_ws(ws, invocation_id, "EXECUTING")
 
         # -----------------------
-        # 실행 + 로그 스트리밍
+        # 실행 + 실시간 로그 + 타임아웃
         # -----------------------
-        # stdout/stderr 를 합쳐 한 스트림으로 보고 한 줄씩 LOG 이벤트로 보냄
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -271,19 +271,39 @@ def run_invocation():
         )
 
         combined_stdout = []
-        try:
-            for line in proc.stdout:
-                line = line.rstrip("\n")
-                combined_stdout.append(line)
-                app.logger.info(f"[Runner:{RUNNER_ID}] runner_exec log: {line}")
-                send_log_ws(ws, invocation_id, line)
 
-            proc.wait(timeout=timeout_ms / 1000.0 + 5)
+        def _reader():
+            """runner_exec stdout을 실시간으로 읽어서 LOG 이벤트로 쏘는 스레드"""
+            try:
+                for line in proc.stdout:
+                    line = line.rstrip("\n")
+                    combined_stdout.append(line)
+                    app.logger.info(f"[Runner:{RUNNER_ID}] runner_exec log: {line}")
+                    send_log_ws(ws, invocation_id, line)
+            except Exception as e:
+                app.logger.warning(f"[Runner:{RUNNER_ID}] log reader thread error: {e}")
+
+        # 로그 읽기 스레드 시작
+        reader_thread = threading.Thread(target=_reader, daemon=True)
+        reader_thread.start()
+
+        try:
+            # 여기서만 타임아웃을 감시
+            proc.wait(timeout=timeout_ms / 1000.0)
         except subprocess.TimeoutExpired:
+            # 프로세스 강제 종료
             proc.kill()
             app.logger.exception(f"[Runner:{RUNNER_ID}] runner_exec 타임아웃")
             duration_ms = timeout_ms
             error_message = "runner_exec timeout"
+
+            # reader 스레드 정리 (최대 1초 정도만 기다리고 넘김)
+            try:
+                reader_thread.join(timeout=1.0)
+            except Exception:
+                pass
+
+            # WebSocket COMPLETE (FAILED - timeout)
             send_complete_failed_ws(ws, invocation_id, duration_ms, error_message)
 
             return jsonify(
@@ -294,6 +314,12 @@ def run_invocation():
                     "reason": error_message,
                 }
             ), 500
+
+        # 정상 종료 시 남은 로그 스레드 정리
+        try:
+            reader_thread.join(timeout=1.0)
+        except Exception:
+            pass
 
         exec_stdout = "\n".join(combined_stdout)
         exec_stderr = ""  # stderr 를 stdout 에 합쳤으므로 별도 없음
