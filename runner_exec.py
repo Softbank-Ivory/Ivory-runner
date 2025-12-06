@@ -6,6 +6,72 @@ import sys
 import os
 import time
 import traceback
+import ast
+
+
+# 호출이 금지된 내장 함수의 이름들.
+BLACKLISTED_BUILTINS = {
+    "open",
+    "eval",
+    "exec",
+    "__import__",
+}
+
+# 접근이 금지된 속성들의 이름 (예: os.system).
+BLACKLISTED_ATTRIBUTES = {
+    # os 모듈의 위험한 속성들
+    "system", "popen", "spawn", "fork", "exec", "execl", "execlp", "execle",
+    "execv", "execve", "execvp", "execvpe", "kill", "killpg", "putenv",
+    # 파일시스템 관련 위험한 속성들
+    "listdir", "remove", "removedirs", "rename", "renames", "rmdir", "symlink",
+    "unlink",
+}
+
+class CodeVisitor(ast.NodeVisitor):
+    """
+    AST를 순회하며 금지된 구문이 있는지 확인합니다.
+    위반 사항이 발견되면 `is_safe` 플래그를 False로 설정합니다.
+    """
+    def __init__(self):
+        self.is_safe = True
+        self.violations = []
+
+    def visit(self, node):
+        # 위반 사항이 이미 발견되었다면 더 이상 검사하지 않습니다.
+        if not self.is_safe:
+            return
+
+        # 금지된 내장 함수 호출이 있는지 확인 (예: open())
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id in BLACKLISTED_BUILTINS:
+                self.is_safe = False
+                self.violations.append(f"금지된 내장 함수 '{node.func.id}' 호출이 {node.lineno}번째 줄에서 발견되었습니다")
+                return
+
+        # 금지된 속성에 접근하는지 확인 (예: os.system)
+        if isinstance(node, ast.Attribute):
+            if node.attr in BLACKLISTED_ATTRIBUTES:
+                self.is_safe = False
+                self.violations.append(f"금지된 속성 '{node.attr}' 사용이 {node.lineno}번째 줄에서 발견되었습니다")
+                return
+
+        # 이 노드에서 위반 사항이 없으면 계속 트리를 순회합니다.
+        super().generic_visit(node)
+
+
+def analyze_code_safety(source: str) -> (bool, list):
+    """
+    소스 코드를 AST로 파싱하고 금지된 작업이 있는지 확인합니다.
+    (is_safe, list_of_violations) 튜플을 반환합니다.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as e:
+        return False, [f"사용자 코드에 문법 오류가 있습니다: {e}"]
+
+    visitor = CodeVisitor()
+    visitor.visit(tree)
+    return visitor.is_safe, visitor.violations
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--workdir", required=True)
@@ -26,7 +92,27 @@ module_name, func_name = handler.split(".")
 # 항상 workdir/code.py 를 로드 (module_name은 모듈 이름용으로만 사용)
 code_file = os.path.join(workdir, "code.py")
 if not os.path.exists(code_file):
-    raise FileNotFoundError(f"code.py not found in workdir: {code_file}")
+    raise FileNotFoundError(f"code.py 가 workdir 에 없습니다: {code_file}")
+
+# ======================= 보안 검사 =======================
+try:
+    with open(code_file, "r", encoding="utf-8") as f:
+        user_code = f.read()
+    
+    is_safe, violations = analyze_code_safety(user_code)
+    
+    if not is_safe:
+        # 모든 위반 메시지를 하나의 문자열로 합칩니다.
+        error_message = "보안 검사 실패: " + ", ".join(violations)
+        raise PermissionError(error_message)
+
+except PermissionError:
+    # 보안 예외는 아래의 메인 예외 핸들러에서 처리되도록 다시 발생시킵니다.
+    raise
+except Exception as e:
+    # 파일 읽기 오류 등 예기치 못한 문제를 처리합니다.
+    raise IOError(f"보안 검사를 위해 코드 파일을 읽거나 분석하는 데 실패했습니다: {e}")
+# ===================== 보안 검사 종료 =====================
 
 spec = importlib.util.spec_from_file_location(module_name, code_file)
 module = importlib.util.module_from_spec(spec)
@@ -73,3 +159,4 @@ if error_info is not None:
 
 with open(result_path, "w", encoding="utf-8") as f:
     json.dump(output, f, ensure_ascii=False)
+
