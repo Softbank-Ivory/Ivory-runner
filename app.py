@@ -4,6 +4,7 @@ import logging
 import tempfile
 import shutil
 import subprocess
+import sys
 import threading
 from typing import Any, Dict, Optional
 
@@ -244,7 +245,7 @@ def run_invocation():
         timeout_ms = 15000
 
         cmd = [
-            "python3",
+            sys.executable,
             RUNNER_EXEC_PATH,
             "--workdir",
             work_dir,
